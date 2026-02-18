@@ -48,6 +48,7 @@ SOURCE = "TubeArchivist Scanner"
 TA_CONFIG = None
 LOG_RETENTION = 5
 METADATA_CACHE = {}  # Cache for playlist and channel metadata during scan
+_SUBSCRIBED_PLAYLISTS = None  # Module-level cache for subscribed playlists (persists across Scan() calls)
 
 
 SSL_CONTEXT = ssl.SSLContext(SSL_PROTOCOL)
@@ -669,6 +670,40 @@ def get_ta_playlist_metadata(plid):
             metadata["refresh_date"] = playlist_refresh.strftime("%Y%m%d")
             metadata["description"] = pl_response["playlist_description"]
             metadata["thumb_url"] = pl_response["playlist_thumbnail"]
+            metadata["playlist_channel_id"] = pl_response.get(
+                "playlist_channel_id", ""
+            )
+            # Extract playlist entries with video positions if available
+            entries = pl_response.get("playlist_entries", [])
+            video_positions = {}
+            entry_channel_ids = set()
+            for entry in entries:
+                vid_id = entry.get("youtube_id", "")
+                idx = entry.get("idx", None)
+                if vid_id and idx is not None:
+                    video_positions[vid_id] = idx
+                # Try to extract channel ID from entry (TA may include it)
+                ch_id = ""
+                if isinstance(entry.get("channel"), dict):
+                    ch_id = entry["channel"].get("channel_id", "")
+                if not ch_id:
+                    ch_id = entry.get("uploader_id", "")
+                if ch_id:
+                    entry_channel_ids.add(ch_id)
+            metadata["video_positions"] = video_positions
+            metadata["entry_channel_ids"] = entry_channel_ids
+            if video_positions:
+                Log.info(
+                    "Playlist '{}' has {} entries with position data.".format(
+                        pl_response["playlist_name"], len(video_positions)
+                    )
+                )
+            if entry_channel_ids:
+                Log.info(
+                    "Playlist '{}' entries span {} channel(s).".format(
+                        pl_response["playlist_name"], len(entry_channel_ids)
+                    )
+                )
             # Cache the result
             METADATA_CACHE[cache_key] = metadata
             return metadata
@@ -683,6 +718,174 @@ def get_ta_playlist_metadata(plid):
             % (mtype, TA_CONFIG["ta_url"], e)
         )
         raise e
+
+
+def fetch_subscribed_playlists():
+    """Fetch all subscribed playlists from TubeArchivist API.
+
+    Returns a dict of {playlist_id: playlist_metadata} for subscribed playlists.
+    Each playlist_metadata includes video_positions and multi_channel flag.
+    Results are cached at module level to persist across Scan() calls.
+    """
+    global _SUBSCRIBED_PLAYLISTS
+    if _SUBSCRIBED_PLAYLISTS is not None:
+        Log.info(
+            "Using cached subscribed playlists ({}).".format(
+                len(_SUBSCRIBED_PLAYLISTS)
+            )
+        )
+        return _SUBSCRIBED_PLAYLISTS
+
+    subscribed = {}
+    if not TA_CONFIG:
+        return subscribed
+
+    page = 1
+    while True:
+        try:
+            request_url = "{}/api/playlist/?page={}".format(
+                TA_CONFIG["ta_url"], page
+            )
+            response = json.loads(
+                read_url(
+                    Request(
+                        request_url,
+                        headers={
+                            "Authorization": "Token {}".format(
+                                TA_CONFIG["ta_api_key"]
+                            )
+                        },
+                    )
+                )
+            )
+            playlist_list = response.get("data", [])
+            if not playlist_list:
+                break
+
+            for pl in playlist_list:
+                pl_id = pl.get("playlist_id", "")
+                if pl.get("playlist_subscribed") and pl_id:
+                    # Fetch full metadata (with entries/positions) via detail endpoint
+                    pl_metadata = get_ta_playlist_metadata(pl_id)
+                    if pl_metadata:
+                        subscribed[pl_id] = pl_metadata
+
+            # Handle pagination
+            paginate = response.get("paginate", {})
+            last_page = paginate.get("last_page", page)
+            if page >= last_page:
+                break
+            page += 1
+
+        except Exception as e:
+            Log.error(
+                "Error fetching subscribed playlists (page {}): {}".format(
+                    page, e
+                )
+            )
+            break
+
+    Log.info(
+        "Fetched {} subscribed playlists from TubeArchivist.".format(
+            len(subscribed)
+        )
+    )
+
+    # Detect multi-channel playlists
+    for pl_id, pl_meta in subscribed.items():
+        entry_channels = pl_meta.get("entry_channel_ids", set())
+        if len(entry_channels) > 1:
+            # Entries already show multiple channels
+            pl_meta["multi_channel"] = True
+        elif entry_channels:
+            # Only one channel found in entries - single channel
+            pl_meta["multi_channel"] = False
+        else:
+            # No channel info in entries - sample videos to detect
+            pl_channel = pl_meta.get("playlist_channel_id", "")
+            channel_ids = set()
+            if pl_channel:
+                channel_ids.add(pl_channel)
+            sample_ids = list(
+                pl_meta.get("video_positions", {}).keys()
+            )[:5]
+            for vid_id in sample_ids:
+                try:
+                    vid_meta = get_ta_video_metadata(vid_id)
+                    if vid_meta:
+                        ch = vid_meta.get("channel_id", "")
+                        if ch:
+                            channel_ids.add(ch)
+                        if len(channel_ids) > 1:
+                            break
+                except Exception:
+                    pass
+            pl_meta["multi_channel"] = len(channel_ids) > 1
+
+        if pl_meta.get("multi_channel"):
+            Log.info(
+                "Playlist '{}' detected as multi-channel.".format(
+                    pl_meta.get("playlist_name", pl_id)
+                )
+            )
+
+    _SUBSCRIBED_PLAYLISTS = subscribed
+    return subscribed
+
+
+def load_season_map():
+    """Load the season map from disk. Checks Logs dir first, then Scanners."""
+    MAP_NAME = "ta_season_map.json"
+    paths = [
+        os.path.join(PLEX_ROOT, "Logs", "TubeArchivist Scanner", MAP_NAME),
+        os.path.join(PLEX_ROOT, "Scanners", "Series", MAP_NAME),
+    ]
+
+    for map_path in paths:
+        if os.path.exists(map_path):
+            try:
+                data = json.loads(read_file(map_path))
+                Log.info(
+                    "Season map loaded from '{}', {} channels.".format(
+                        map_path, len(data)
+                    )
+                )
+                return data
+            except Exception as e:
+                Log.error(
+                    "Error reading season map from '{}': {}".format(
+                        map_path, e
+                    )
+                )
+
+    Log.info("No season map file found, starting fresh.")
+    return {}
+
+
+def save_season_map(season_map):
+    """Save the season map to disk. Tries Logs dir first (writable), then Scanners."""
+    MAP_NAME = "ta_season_map.json"
+    # Try Logs dir first - Scanners/Series/ is often read-only in Docker
+    paths = [
+        os.path.join(PLEX_ROOT, "Logs", "TubeArchivist Scanner", MAP_NAME),
+        os.path.join(PLEX_ROOT, "Scanners", "Series", MAP_NAME),
+    ]
+
+    for map_path in paths:
+        try:
+            map_dir = os.path.dirname(map_path)
+            if not os.path.exists(map_dir):
+                os.makedirs(map_dir)
+            with open(map_path, "w") as f:
+                json.dump(season_map, f, indent=2)
+            Log.info(
+                "Season map saved to '{}'.".format(map_path)
+            )
+            return
+        except Exception:
+            pass  # Try next path
+
+    Log.error("Failed to save season map to any location.")
 
 
 def Scan(path, files, mediaList, subdirs):  # noqa: C901
@@ -703,180 +906,227 @@ def Scan(path, files, mediaList, subdirs):  # noqa: C901
     paths = Utils.SplitPath(path)
 
     if len(paths) > 0 and len(paths[0]) > 0:
-        done = False
-        episode_counts = {}
-        if not done:
+        if not TA_CONFIG.get("online"):
+            Log.error(
+                "TubeArchivist instance is not accessible or not online. Unable to process video files."  # noqa: E501
+            )
+        elif TA_CONFIG["version"] == []:
+            Log.error(
+                "TubeArchivist instance version is unknown or unset. Please review the logs further and ensure that there is connectivity between Plex and TubeArchivist."  # noqa: E501
+            )
+        else:
+            # Fetch all subscribed playlists upfront (cached across Scan() calls)
+            subscribed_playlists = fetch_subscribed_playlists()
+            subscribed_pl_ids = set(subscribed_playlists.keys())
+
+            # Track season assignments: {channel_id: {playlist_id: season_num}}
+            channel_playlist_seasons = {}
+            # Season map for agent: {key: {season_str: {playlist_id, playlist_name}}}
+            season_map = load_season_map()
+            # Pre-populate channel_playlist_seasons from existing season map
+            # so that playlists keep stable season numbers across scans
+            for ch_id, seasons in season_map.items():
+                if ch_id not in channel_playlist_seasons:
+                    channel_playlist_seasons[ch_id] = {}
+                for season_str, info in seasons.items():
+                    pl_id = info.get("playlist_id")
+                    if pl_id and season_str != "0":
+                        channel_playlist_seasons[ch_id][pl_id] = int(season_str)  # noqa: E501
+            unsorted_episode_counts = {}
+
             (show, year) = VideoFiles.CleanName(paths[0])
 
             for i in files:
                 file = os.path.basename(i)
                 Log.info("Processing file with scanner: {}".format(file))
                 (file, ext) = os.path.splitext(file)
-                episode = ""
 
                 for rx in TA_REGEXS:
                     match = re.search(rx, file, re.IGNORECASE)
-                    video_metadata = {}
-                    if match:
-                        Log.info("File matches expected filename layout.")
-                        if TA_CONFIG["online"]:
-                            if TA_CONFIG["version"] == []:
-                                Log.error(
-                                    "TubeArchivist instance version is unknown or unset. Please review the logs further and ensure that there is connectivity between Plex and TubeArchivist."  # noqa: E501
-                                )
-                                break
-                            if TA_CONFIG["version"] < [0, 3, 7]:
-                                Log.info(
-                                    "Processing filename with legacy filename format."  # noqa: E501
-                                )
-                                originalAirDate = file[0:7]
-                                ytid = file[9:20]
-                                title = file[21:]
-                                season = originalAirDate[0:4]
-                                episode = originalAirDate[5:]
-                            else:
-                                ytid = file
-                            try:
-                                video_metadata = get_ta_video_metadata(ytid)
+                    if not match:
+                        continue
 
-                                # Determine which shows to create based on subscription status
-                                shows_to_create = []
+                    Log.info("File matches expected filename layout.")
 
-                                # Check for subscribed playlists first
-                                playlist_ids = video_metadata.get("playlist", [])
-                                for playlist_id in playlist_ids:
-                                    try:
-                                        pl_metadata = get_ta_playlist_metadata(playlist_id)  # noqa: E501
-                                        if pl_metadata and pl_metadata.get("playlist_subscribed"):  # noqa: E501
-                                            shows_to_create.append({
-                                                "type": "playlist",
-                                                "show": pl_metadata["show"],
-                                                "metadata": pl_metadata
-                                            })
-                                            Log.info(
-                                                "Video belongs to subscribed playlist: {}".format(  # noqa: E501
-                                                    pl_metadata["playlist_name"]
-                                                )
-                                            )
-                                    except Exception as e:
-                                        Log.error(
-                                            "Error fetching playlist metadata for {}: {}".format(  # noqa: E501
-                                                playlist_id, e
-                                            )
-                                        )
+                    if TA_CONFIG["version"] < [0, 3, 7]:
+                        Log.info(
+                            "Processing filename with legacy filename format."
+                        )
+                        ytid = file[9:20]
+                    else:
+                        ytid = file
 
-                                # Also check if channel is subscribed (can appear in both playlist and channel)
-                                channel_id = video_metadata.get("channel_id")
-                                if channel_id:
-                                    try:
-                                        ch_metadata = get_ta_channel_metadata(channel_id)  # noqa: E501
-                                        if ch_metadata and ch_metadata.get("channel_subscribed"):  # noqa: E501
-                                            shows_to_create.append({
-                                                "type": "channel",
-                                                "show": video_metadata["show"],
-                                                "metadata": ch_metadata
-                                            })
-                                            Log.info(
-                                                "Video from subscribed channel: {}".format(  # noqa: E501
-                                                    video_metadata["channel_name"]
-                                                )
-                                            )
-                                        elif not shows_to_create:
-                                            # Only log skip if not in any subscribed playlists
-                                            Log.info(
-                                                "Video channel not subscribed, skipping: {}".format(  # noqa: E501
-                                                    video_metadata["channel_name"]
-                                                )
-                                            )
-                                    except Exception as e:
-                                        Log.error(
-                                            "Error fetching channel metadata for {}: {}".format(  # noqa: E501
-                                                channel_id, e
-                                            )
-                                        )
-
-                                # Skip video if no subscribed playlists or channels
-                                if not shows_to_create:
-                                    Log.info(
-                                        "Skipping video '{}' - no subscribed playlists or channels".format(  # noqa: E501
-                                            video_metadata["title"]
-                                        )
-                                    )
-                                    continue
-
-                                # Process common metadata
-                                if "video" in video_metadata["type"]:
-                                    title = video_metadata["title"]
-                                    season = video_metadata["season"]
-                                else:
-                                    title = "[{}] {}".format(
-                                        video_metadata["type"].upper(),
-                                        video_metadata["title"],
-                                    )
-                                    season = 0
-                                episode_base = video_metadata["episode"]
-
-                                # Create Media.Episode for each show (playlist or channel)
-                                for show_info in shows_to_create:
-                                    show = show_info["show"]
-
-                                    # Track episode counts per show
-                                    if show not in episode_counts:
-                                        episode_counts[show] = {}
-                                    if season not in episode_counts[show]:
-                                        episode_counts[show][season] = {}
-                                    if episode_base not in episode_counts[show][season]:  # noqa: E501
-                                        episode_counts[show][season][episode_base] = 0
-                                    episode_counts[show][season][episode_base] += 1
-                                    episode = "{}{:02d}".format(
-                                        str(episode_base[2:]),
-                                        episode_counts[show][season][episode_base],
-                                    )
-
-                                    tv_show = Media.Episode(
-                                        str(show).encode("UTF-8"),
-                                        str(season).encode("UTF-8"),
-                                        episode,
-                                        str(title).encode("UTF-8"),
-                                        str(season).encode("UTF-8"),
-                                    )
-                                    Log.info(
-                                        "Identified episode '{} - {}' with TV Show {} ({}) under Season {}.".format(  # noqa: E501
-                                            episode, title, show, show_info["type"], season  # noqa: E501
-                                        )
-                                    )
-                                    episode_split = [
-                                        str(episode[x : x + 2])  # noqa: E203
-                                        for x in range(0, len(episode), 2)
-                                    ]
-                                    tv_show.released_at = str(
-                                        "{}-{}-{}".format(
-                                            episode_split[0],
-                                            episode_split[1],
-                                            episode_split[2],
-                                        )
-                                    ).encode("UTF-8")
-                                    tv_show.parts.append(i)
-                                    Log.info(
-                                        "Adding episode '{}' to TV show '{}' list of episodes.".format(  # noqa: E501
-                                            episode, show
-                                        )
-                                    )
-                                    mediaList.append(tv_show)
-
-                            except Exception as e:
-                                Log.error(
-                                    "Issue with fetching or setting metadata from video using response metadata: '%s', Exception: '%s'"  # noqa: E501
-                                    % (str(video_metadata), e)
-                                )
-                                continue
-                        else:
+                    try:
+                        video_metadata = get_ta_video_metadata(ytid)
+                        if not video_metadata:
                             Log.error(
-                                "TubeArchivist instance is not accessible or not online. Unable to process video file."  # noqa: E501
+                                "No metadata returned for video: {}".format(ytid)  # noqa: E501
                             )
                             break
 
-                        break
+                        channel_id = video_metadata.get("channel_id", "")
+
+                        # Find FIRST subscribed playlist this video belongs to
+                        assigned_playlist = None
+                        playlist_ids = video_metadata.get("playlist", [])
+                        for pl_id in playlist_ids:
+                            if pl_id in subscribed_pl_ids:
+                                assigned_playlist = pl_id
+                                break
+
+                        show_name = video_metadata["show"]  # Channel name (default)
+                        title = video_metadata["title"]
+
+                        if "video" not in video_metadata.get("type", "video"):
+                            title = "[{}] {}".format(
+                                video_metadata["type"].upper(), title
+                            )
+
+                        # Check if assigned playlist is multi-channel
+                        # (pre-detected from API data in fetch_subscribed_playlists)
+                        is_multi_channel = (
+                            assigned_playlist
+                            and subscribed_playlists.get(
+                                assigned_playlist, {}
+                            ).get("multi_channel", False)
+                        )
+
+                        if is_multi_channel:
+                            # Multi-channel playlist: playlist = show, year = season
+                            pl_meta = subscribed_playlists[assigned_playlist]
+                            show_name = pl_meta["show"]  # "Playlist Name [PLxxxx]"
+                            season = video_metadata["season"]  # year
+                            episode = video_metadata["episode"]  # date-based
+
+                            Log.info(
+                                "Video '{}' -> multi-channel playlist '{}', season {} (year), episode {}".format(  # noqa: E501
+                                    ytid,
+                                    pl_meta.get("playlist_name", assigned_playlist),
+                                    season, episode,
+                                )
+                            )
+
+                        elif assigned_playlist:
+                            # Single-channel playlist: channel = show, playlist = season
+                            pl_meta = subscribed_playlists[assigned_playlist]
+
+                            if channel_id not in channel_playlist_seasons:
+                                channel_playlist_seasons[channel_id] = {}
+                            if channel_id not in season_map:
+                                season_map[channel_id] = {}
+
+                            if assigned_playlist not in channel_playlist_seasons[channel_id]:  # noqa: E501
+                                season_num = len(channel_playlist_seasons[channel_id]) + 1  # noqa: E501
+                                channel_playlist_seasons[channel_id][assigned_playlist] = season_num  # noqa: E501
+                                season_map[channel_id][str(season_num)] = {
+                                    "playlist_id": assigned_playlist,
+                                    "playlist_name": pl_meta.get(
+                                        "playlist_name", assigned_playlist
+                                    ),
+                                }
+                                Log.info(
+                                    "Assigned season {} to playlist '{}' under channel {}".format(  # noqa: E501
+                                        season_num,
+                                        pl_meta.get("playlist_name", assigned_playlist),
+                                        channel_id,
+                                    )
+                                )
+
+                            season = channel_playlist_seasons[channel_id][assigned_playlist]  # noqa: E501
+
+                            # Episode = position in playlist (1-indexed)
+                            positions = pl_meta.get("video_positions", {})
+                            if ytid in positions:
+                                episode = positions[ytid]
+                                if episode == 0:
+                                    episode = 1  # Ensure 1-indexed
+                            else:
+                                # Fallback: date-based episode number
+                                episode = video_metadata["episode"]
+                                Log.debug(
+                                    "No position data for '{}' in playlist, using date-based episode: {}".format(  # noqa: E501
+                                        ytid, episode
+                                    )
+                                )
+
+                            Log.info(
+                                "Video '{}' -> playlist season {} ('{}'), episode {}".format(  # noqa: E501
+                                    ytid, season,
+                                    pl_meta.get("playlist_name", assigned_playlist),
+                                    episode,
+                                )
+                            )
+
+                        else:
+                            # Not in any subscribed playlist - check channel subscription
+                            ch_metadata = get_ta_channel_metadata(channel_id)
+                            if ch_metadata and ch_metadata.get("channel_subscribed"):
+                                # Assign to season 0 (unsorted) with date-based episode
+                                season = 0
+                                episode_base = video_metadata["episode"]
+
+                                # Track duplicates within unsorted season
+                                unsorted_key = (show_name, episode_base)
+                                if unsorted_key not in unsorted_episode_counts:
+                                    unsorted_episode_counts[unsorted_key] = 0
+                                unsorted_episode_counts[unsorted_key] += 1
+                                episode = "{}{:02d}".format(
+                                    str(episode_base[2:]),
+                                    unsorted_episode_counts[unsorted_key],
+                                )
+
+                                # Ensure season 0 is in the season map
+                                if channel_id not in season_map:
+                                    season_map[channel_id] = {}
+                                if "0" not in season_map[channel_id]:
+                                    season_map[channel_id]["0"] = {
+                                        "playlist_id": None,
+                                        "playlist_name": "Unsorted",
+                                    }
+
+                                Log.info(
+                                    "Video '{}' -> unsorted (season 0), episode {}".format(  # noqa: E501
+                                        ytid, episode
+                                    )
+                                )
+                            else:
+                                Log.info(
+                                    "Skipping video '{}' - not in subscribed playlist or channel".format(  # noqa: E501
+                                        video_metadata.get("title", ytid)
+                                    )
+                                )
+                                break
+
+                        tv_show = Media.Episode(
+                            str(show_name).encode("UTF-8"),
+                            str(season).encode("UTF-8"),
+                            str(episode),
+                            str(title).encode("UTF-8"),
+                            str(video_metadata.get("season", "")).encode("UTF-8"),
+                        )
+                        tv_show.released_at = str(
+                            video_metadata["processed_date"].strftime("%Y-%m-%d")
+                        ).encode("UTF-8")
+                        tv_show.parts.append(i)
+                        mediaList.append(tv_show)
+
+                        Log.info(
+                            "Added episode {} ('{}') to show '{}', season {}.".format(  # noqa: E501
+                                episode, title, show_name, season
+                            )
+                        )
+
+                    except Exception as e:
+                        Log.error(
+                            "Issue with fetching metadata for video '%s', Exception: '%s'"  # noqa: E501
+                            % (ytid, e)
+                        )
+
+                    break  # Break out of regex loop after first match
+
+            # Save season map for the agent to read
+            if season_map:
+                save_season_map(season_map)
 
     Stack.Scan(path, files, mediaList, subdirs)
     Log.info("Scan completed for library files.")

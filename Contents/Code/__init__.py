@@ -494,6 +494,7 @@ def get_ta_video_metadata(ytid):
             metadata["runtime"] = vid_response["player"]["duration_str"]
             metadata["thumb_url"] = vid_response["vid_thumb_url"]
             metadata["type"] = vid_response["vid_type"]
+            metadata["playlist"] = vid_response.get("playlist", [])
             metadata["has_subtitles"] = (
                 True if "subtitles" in vid_response else False
             )
@@ -598,7 +599,11 @@ def get_ta_playlist_metadata(plid):
                 pl_response["playlist_description"],
                 pl_response["playlist_id"],
             )
+            metadata["playlist_description"] = pl_response.get(
+                "playlist_description", ""
+            )
             metadata["thumb_url"] = pl_response["playlist_thumbnail"]
+            metadata["playlist_name"] = pl_response["playlist_name"]
             metadata["playlist_channel"] = pl_response["playlist_channel"]
             metadata["playlist_channel_id"] = pl_response["playlist_channel_id"]
             return metadata
@@ -613,6 +618,55 @@ def get_ta_playlist_metadata(plid):
             % (mtype, TA_CONFIG["ta_url"], e)
         )
         raise e
+
+
+def get_plex_token():
+    """Read the Plex server token from Preferences.xml."""
+    prefs_path = os.path.join(PLEX_ROOT, "Preferences.xml")
+    try:
+        content = read_file(prefs_path)
+        match = re.search(r'PlexOnlineToken="([^"]+)"', content)
+        if match:
+            return match.group(1)
+    except Exception as e:
+        Log.Warning(  # type: ignore # noqa: F821
+            "Could not read Plex token: {}".format(e)
+        )
+    return ""
+
+
+def set_season_metadata_via_api(rating_key, plex_token, title=None, summary=None):
+    """Set season metadata using the Plex HTTP API directly."""
+    try:
+        params = []
+        if title:
+            params.append(
+                "title.value={}".format(
+                    String.Quote(title)  # type: ignore # noqa: F821
+                )
+            )
+        if summary:
+            params.append(
+                "summary.value={}".format(
+                    String.Quote(summary)  # type: ignore # noqa: F821
+                )
+            )
+        if not params:
+            return False
+        url = "http://127.0.0.1:32400/library/metadata/{}?{}&X-Plex-Token={}".format(  # noqa: E501
+            rating_key, "&".join(params), plex_token
+        )
+        request = Request(url)
+        request.get_method = lambda: "PUT"
+        urlopen(request, context=SSL_CONTEXT)
+        return True
+    except Exception as e:
+        Log.Warning(  # type: ignore # noqa: F821
+            "HTTP API failed for season ratingKey {}: {}".format(
+                rating_key, e
+            )
+        )
+        return False
 
 
 def PullTASubtitles(vid_metadata, filepath, media_obj):  # noqa: C901
@@ -993,6 +1047,9 @@ def Update(metadata, media, lang, force):  # noqa: C901
             "Show metadata updates completed for {}.".format(show_title)
         )
 
+        # Track first playlist ID per season for deriving season titles
+        season_playlist_map = {}
+
         episodes = 0
 
         try:
@@ -1029,6 +1086,11 @@ def Update(metadata, media, lang, force):  # noqa: C901
 
                     if TA_CONFIG["online"]:
                         vid_metadata = get_ta_video_metadata(episode_id)
+                        # Track first playlist for this season
+                        if s not in season_playlist_map:
+                            pl_ids = vid_metadata.get("playlist", [])
+                            if pl_ids:
+                                season_playlist_map[s] = pl_ids[0]
                         episode.title = vid_metadata["title"]
                         episode.summary = "Runtime: {}\nYouTube ID: {}{}\nVideo Title: {}\n{}".format(  # noqa: E501
                             vid_metadata["runtime"],
@@ -1095,8 +1157,8 @@ def Update(metadata, media, lang, force):  # noqa: C901
                                 )
                             )
                         Log.Info(  # type: ignore # noqa: F821
-                            "Episode '{} - {}' for channel {} processed successfully.".format(  # noqa: E501
-                                episode_id, episode.title, channel_title
+                            "Episode '{} - {}' for show {} processed successfully.".format(  # noqa: E501
+                                episode_id, episode.title, show_title
                             )
                         )
         except AttributeError as ex:
@@ -1107,9 +1169,89 @@ def Update(metadata, media, lang, force):  # noqa: C901
             )
         Log.Info(  # type: ignore # noqa: F821
             "All episode files processed for {}. Count: {}".format(
-                channel_title, str(episodes)
+                show_title, str(episodes)
             )
         )
+
+        # Set season metadata via Plex HTTP API
+        # (metadata.seasons[s].title doesn't persist through the agent proxy)
+        # Skip for playlist shows (multi-channel) - seasons are years there
+        if season_playlist_map and not is_playlist:
+            plex_token = get_plex_token()
+            Log.Info(  # type: ignore # noqa: F821
+                "Setting season metadata for {} seasons (token: {}).".format(
+                    len(season_playlist_map),
+                    "found" if plex_token else "NOT FOUND",
+                )
+            )
+            for s, pl_id in season_playlist_map.items():
+                try:
+                    pl_meta = get_ta_playlist_metadata(pl_id)
+                    if not pl_meta:
+                        continue
+                    playlist_name = pl_meta.get(
+                        "playlist_name", pl_meta.get("show", "")
+                    )
+                    if not playlist_name:
+                        continue
+
+                    playlist_desc = pl_meta.get("playlist_description", "")
+                    thumb_url = pl_meta.get("thumb_url", "")
+
+                    # Get the season's ratingKey from the media object
+                    season_rating_key = getattr(
+                        media.seasons[s], "id", None
+                    )
+
+                    # Set title and summary via HTTP API
+                    if plex_token and season_rating_key:
+                        success = set_season_metadata_via_api(
+                            season_rating_key,
+                            plex_token,
+                            title=playlist_name,
+                            summary=playlist_desc,
+                        )
+                        if success:
+                            Log.Info(  # type: ignore # noqa: F821
+                                "Set season {} title='{}', summary via API.".format(  # noqa: E501
+                                    s, playlist_name
+                                )
+                            )
+                    else:
+                        metadata.seasons[s].title = playlist_name
+                        metadata.seasons[s].summary = playlist_desc
+
+                    # Set season poster from playlist thumbnail
+                    if thumb_url and TA_CONFIG.get("online"):
+                        poster_key = "{}_{}".format(
+                            pl_meta.get("refresh_date", ""), thumb_url
+                        )
+                        if poster_key not in metadata.seasons[s].posters:
+                            metadata.seasons[s].posters[poster_key] = Proxy.Media(  # type: ignore # noqa: F821, E501
+                                read_url(
+                                    Request(
+                                        "{}{}".format(
+                                            TA_CONFIG["ta_url"], thumb_url
+                                        ),
+                                        headers={
+                                            "Authorization": "Token {}".format(
+                                                TA_CONFIG["ta_api_key"]
+                                            )
+                                        },
+                                    )
+                                ),
+                                sort_order=1,
+                            )
+                            Log.Info(  # type: ignore # noqa: F821
+                                "Set season {} poster from playlist thumbnail.".format(s)  # noqa: E501
+                            )
+                except Exception as ex:
+                    Log.Warning(  # type: ignore # noqa: F821
+                        "Could not set metadata for season {}: {}".format(
+                            s, ex
+                        )
+                    )
+
         Log.Info(  # type: ignore # noqa: F821
             "=== End Of Agent's Update Call, errors after this are Plex related ==="  # noqa: E501
         )
